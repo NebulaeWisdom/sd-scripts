@@ -74,6 +74,7 @@ import library.model_util as model_util
 import library.huggingface_util as huggingface_util
 import library.sai_model_spec as sai_model_spec
 import library.deepspeed_utils as deepspeed_utils
+from library.caption_builder import build_caption
 from library.utils import setup_logging, resize_image, validate_interpolation_fn
 
 setup_logging()
@@ -1712,7 +1713,9 @@ class BaseDataset(torch.utils.data.Dataset):
             text_encoder_outputs_list.append(text_encoder_outputs)
 
             if tokenization_required:
-                caption = self.process_caption(subset, image_info.caption)
+                path_hash = int(hashlib.md5(image_info.image_key.encode("utf-8")).hexdigest()[:8], 16)
+                caption_seed = int(self.seed) + int(self.current_step) + path_hash
+                caption = build_caption(caption_seed, image_info.caption)
                 input_ids = [ids[0] for ids in self.tokenize_strategy.tokenize(caption)]  # remove batch dimension
                 # if self.XTI_layers:
                 #     caption_layer = []
