@@ -120,6 +120,7 @@ class DreamBoothDatasetParams(BaseDatasetParams):
     bucket_reso_steps: int = 64
     bucket_no_upscale: bool = False
     prior_loss_weight: float = 1.0
+    caption_dataset_path: Optional[str] = None
 
 @dataclass
 class FineTuningDatasetParams(BaseDatasetParams):

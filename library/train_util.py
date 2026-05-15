@@ -1963,6 +1963,7 @@ class DreamBoothDataset(BaseDataset):
         validation_seed: Optional[int],
         resize_interpolation: Optional[str],
         skip_image_resolution: Optional[Tuple[int, int]] = None,
+        caption_dataset_path: Optional[str] = None,
     ) -> None:
         super().__init__(
             resolution,
@@ -1997,6 +1998,22 @@ class DreamBoothDataset(BaseDataset):
             self.max_bucket_reso = None
             self.bucket_reso_steps = None  # この情報は使われない
             self.bucket_no_upscale = False
+
+        self.caption_dataset_path = caption_dataset_path
+        self._caption_dataset = None
+        self._caption_index: Dict[str, int] = {}  # image_key -> row index
+        self._last_epoch = 0
+
+        if caption_dataset_path is not None:
+            from datasets import load_from_disk
+
+            self._caption_dataset = load_from_disk(caption_dataset_path)
+            # Build index for O(1) lookup by image_key
+            for i, row in enumerate(tqdm(self._caption_dataset, desc="Building caption dataset index")):
+                self._caption_index[row["image_key"]] = i
+            logger.info(
+                f"Loaded caption dataset from {caption_dataset_path}: {len(self._caption_index)} entries"
+            )
 
         def read_caption(img_path, caption_extension, enable_wildcard):
             # captionの候補ファイル名を作る
@@ -2043,7 +2060,7 @@ class DreamBoothDataset(BaseDataset):
                     use_cached_info_for_subset = False
 
             if use_cached_info_for_subset:
-                # json: {`img_path`:{"caption": "caption...", "resolution": [width, height]}, ...}
+                # json: {img_path:{"resolution": [width, height]}, ...}
                 with open(info_cache_file, "r", encoding="utf-8") as f:
                     metas = json.load(f)
                 img_paths = list(metas.keys())
@@ -2130,6 +2147,11 @@ class DreamBoothDataset(BaseDataset):
                     )
 
             logger.info(f"found directory {subset.image_dir} contains {len(img_paths)} image files")
+
+            # If using external caption dataset, skip caption reading from files
+            if self.caption_dataset_path is not None:
+                # captions come from HF dataset at runtime
+                return img_paths, [""] * len(img_paths), sizes
 
             if use_cached_info_for_subset:
                 captions = [metas[img_path]["caption"] for img_path in img_paths]
@@ -2255,6 +2277,310 @@ class DreamBoothDataset(BaseDataset):
                 first_loop = False
 
         self.num_reg_images = num_reg_images
+
+    def _get_caption(self, image_key: str) -> str:
+        """从 HF dataset 获取当前 epoch 对应的 caption。未启用返回空字符串。"""
+        if self._caption_dataset is None:
+            return ""
+        idx = self._caption_index.get(image_key)
+        if idx is None:
+            return ""
+        captions = self._caption_dataset[idx]["captions"]
+        if isinstance(captions, str):
+            captions = [captions]
+        if not captions:
+            return ""
+        epoch_idx = (self.current_epoch - 1) % max(1, len(captions))
+        result = captions[epoch_idx]
+        return str(result) if result is not None else ""
+
+    # 原版BaseDataset.__getitem__是一个上帝函数，修改caption注入点需要大量参数粘连。
+    # 直接复制整个方法过来改一行caption是最省事的做法。
+    def __getitem__(self, index):
+        bucket = self.bucket_manager.buckets[self.buckets_indices[index].bucket_index]
+        bucket_batch_size = self.buckets_indices[index].bucket_batch_size
+        image_index = self.buckets_indices[index].batch_index * bucket_batch_size
+
+        if self.caching_mode is not None:  # return batch for latents/text encoder outputs caching
+            return self.get_item_for_caching(bucket, bucket_batch_size, image_index)
+
+        loss_weights = []
+        captions = []
+        input_ids_list = []
+        latents_list = []
+        alpha_mask_list = []
+        images = []
+        original_sizes_hw = []
+        crop_top_lefts = []
+        target_sizes_hw = []
+        flippeds = []  # 変数名が微妙
+        text_encoder_outputs_list = []
+        custom_attributes = []
+        masks = []
+        masked_images = []
+
+        for image_key in bucket[image_index : image_index + bucket_batch_size]:
+            image_info = self.image_data[image_key]
+            subset = self.image_to_subset[image_key]
+
+            custom_attributes.append(subset.custom_attributes)
+
+            # in case of fine tuning, is_reg is always False
+            loss_weights.append(self.prior_loss_weight if image_info.is_reg else 1.0)
+
+            flipped = subset.flip_aug and random.random() < 0.5  # not flipped or flipped with 50% chance
+
+            # image/latentsを処理する
+            if image_info.latents is not None:  # cache_latents=Trueの場合
+                original_size = image_info.latents_original_size
+                crop_ltrb = image_info.latents_crop_ltrb  # calc values later if flipped
+                if not flipped:
+                    latents = image_info.latents
+                    alpha_mask = image_info.alpha_mask
+                else:
+                    latents = image_info.latents_flipped
+                    alpha_mask = None if image_info.alpha_mask is None else torch.flip(image_info.alpha_mask, [1])
+
+                image = None
+            elif image_info.latents_npz is not None:  # FineTuningDatasetまたはcache_latents_to_disk=Trueの場合
+                latents, original_size, crop_ltrb, flipped_latents, alpha_mask = (
+                    self.latents_caching_strategy.load_latents_from_disk(image_info.latents_npz, image_info.bucket_reso)
+                )
+                if flipped:
+                    latents = flipped_latents
+                    alpha_mask = None if alpha_mask is None else alpha_mask[:, ::-1].copy()  # copy to avoid negative stride problem
+                    del flipped_latents
+                latents = torch.FloatTensor(latents)
+                if alpha_mask is not None:
+                    alpha_mask = torch.FloatTensor(alpha_mask)
+
+                image = None
+            else:
+                # 画像を読み込み、必要ならcropする
+                img, face_cx, face_cy, face_w, face_h = self.load_image_with_face_info(
+                    subset, image_info.absolute_path, subset.alpha_mask
+                )
+                im_h, im_w = img.shape[0:2]
+
+                if self.enable_bucket:
+                    img, original_size, crop_ltrb = trim_and_resize_if_required(
+                        subset.random_crop,
+                        img,
+                        image_info.bucket_reso,
+                        image_info.resized_size,
+                        resize_interpolation=image_info.resize_interpolation,
+                    )
+                else:
+                    if face_cx > 0:  # 顔位置情報あり
+                        img = self.crop_target(subset, img, face_cx, face_cy, face_w, face_h)
+                    elif im_h > self.height or im_w > self.width:
+                        assert (
+                            subset.random_crop
+                        ), f"image too large, but cropping and bucketing are disabled / 画像サイズが大きいのでface_crop_aug_rangeかrandom_crop、またはbucketを有効にしてください: {image_info.absolute_path}"
+                        if im_h > self.height:
+                            p = random.randint(0, im_h - self.height)
+                            img = img[p : p + self.height]
+                        if im_w > self.width:
+                            p = random.randint(0, im_w - self.width)
+                            img = img[:, p : p + self.width]
+
+                    im_h, im_w = img.shape[0:2]
+                    assert (
+                        im_h == self.height and im_w == self.width
+                    ), f"image size is small / 画像サイズが小さいようです: {image_info.absolute_path}"
+
+                    original_size = [im_w, im_h]
+                    crop_ltrb = (0, 0, 0, 0)
+
+                # augmentation
+                aug = self.aug_helper.get_augmentor(subset.color_aug)
+                if aug is not None:
+                    # augment RGB channels only
+                    img_rgb = img[:, :, :3]
+                    img_rgb = aug(image=img_rgb)["image"]
+                    img[:, :, :3] = img_rgb
+
+                if flipped:
+                    img = img[:, ::-1, :].copy()  # copy to avoid negative stride problem
+
+                if subset.alpha_mask:
+                    if img.shape[2] == 4:
+                        alpha_mask = img[:, :, 3]  # [H,W]
+                        alpha_mask = alpha_mask.astype(np.float32) / 255.0  # 0.0~1.0
+                        alpha_mask = torch.FloatTensor(alpha_mask)
+                    else:
+                        alpha_mask = torch.ones((img.shape[0], img.shape[1]), dtype=torch.float32)
+                else:
+                    alpha_mask = None
+
+                img = img[:, :, :3]  # remove alpha channel
+
+                if self.train_inpainting:
+                    pil_image = transforms.functional.to_pil_image(img)
+                    mask = self.random_mask(pil_image.size)
+                    mask, masked_image = self.prepare_mask_and_masked_image(pil_image, mask)
+
+                    masks.append(mask)
+                    masked_images.append(masked_image)
+
+                latents = None
+                image = self.image_transforms(img)  # -1.0~1.0のtorch.Tensorになる
+                del img
+
+            images.append(image)
+            latents_list.append(latents)
+            alpha_mask_list.append(alpha_mask)
+
+            target_size = (image.shape[2], image.shape[1]) if image is not None else (latents.shape[2] * 8, latents.shape[1] * 8)
+
+            if not flipped:
+                crop_left_top = (crop_ltrb[0], crop_ltrb[1])
+            else:
+                # crop_ltrb[2] is right, so target_size[0] - crop_ltrb[2] is left in flipped image
+                crop_left_top = (target_size[0] - crop_ltrb[2], crop_ltrb[1])
+
+            original_sizes_hw.append((int(original_size[1]), int(original_size[0])))
+            crop_top_lefts.append((int(crop_left_top[1]), int(crop_left_top[0])))
+            target_sizes_hw.append((int(target_size[1]), int(target_size[0])))
+            flippeds.append(flipped)
+
+            # captionとtext encoder outputを処理する
+            caption = image_info.caption  # default
+
+            tokenization_required = (
+                self.text_encoder_output_caching_strategy is None or self.text_encoder_output_caching_strategy.is_partial
+            )
+            text_encoder_outputs = None
+            input_ids = None
+
+            if image_info.text_encoder_outputs is not None:
+                # cached
+                text_encoder_outputs = image_info.text_encoder_outputs
+            elif image_info.text_encoder_outputs_npz is not None:
+                # on disk
+                text_encoder_outputs = self.text_encoder_output_caching_strategy.load_outputs_npz(
+                    image_info.text_encoder_outputs_npz
+                )
+            else:
+                tokenization_required = True
+            text_encoder_outputs_list.append(text_encoder_outputs)
+
+            if tokenization_required:
+                if self._caption_dataset is not None:
+                    caption = self._get_caption(image_info.image_key) 
+                else:
+                    caption = self.process_caption(subset, image_info.caption)
+                input_ids = [ids[0] for ids in self.tokenize_strategy.tokenize(caption)]  # remove batch dimension
+                # if self.XTI_layers:
+                #     caption_layer = []
+                #     for layer in self.XTI_layers:
+                #         token_strings_from = " ".join(self.token_strings)
+                #         token_strings_to = " ".join([f"{x}_{layer}" for x in self.token_strings])
+                #         caption_ = caption.replace(token_strings_from, token_strings_to)
+                #         caption_layer.append(caption_)
+                #     captions.append(caption_layer)
+                # else:
+                #     captions.append(caption)
+
+                # if not self.token_padding_disabled:  # this option might be omitted in future
+                #     # TODO get_input_ids must support SD3
+                #     if self.XTI_layers:
+                #         token_caption = self.get_input_ids(caption_layer, self.tokenizers[0])
+                #     else:
+                #         token_caption = self.get_input_ids(caption, self.tokenizers[0])
+                #     input_ids_list.append(token_caption)
+
+                #     if len(self.tokenizers) > 1:
+                #         if self.XTI_layers:
+                #             token_caption2 = self.get_input_ids(caption_layer, self.tokenizers[1])
+                #         else:
+                #             token_caption2 = self.get_input_ids(caption, self.tokenizers[1])
+                #         input_ids2_list.append(token_caption2)
+
+            input_ids_list.append(input_ids)
+            captions.append(caption)
+
+        def none_or_stack_elements(tensors_list, converter):
+            # [[clip_l, clip_g, t5xxl], [clip_l, clip_g, t5xxl], ...] -> [torch.stack(clip_l), torch.stack(clip_g), torch.stack(t5xxl)]
+            if len(tensors_list) == 0 or tensors_list[0] == None or len(tensors_list[0]) == 0 or tensors_list[0][0] is None:
+                return None
+
+            # old implementation without padding: all elements must have same length
+            # return [torch.stack([converter(x[i]) for x in tensors_list]) for i in range(len(tensors_list[0]))]
+
+            # new implementation with padding support
+            result = []
+            for i in range(len(tensors_list[0])):
+                tensors = [x[i] for x in tensors_list]
+                if tensors[0].ndim == 0:
+                    # scalar value: e.g. ocr mask
+                    result.append(torch.stack([converter(x[i]) for x in tensors_list]))
+                    continue
+
+                min_len = min([len(x) for x in tensors])
+                max_len = max([len(x) for x in tensors])
+
+                if min_len == max_len:
+                    # no padding
+                    result.append(torch.stack([converter(x) for x in tensors]))
+                else:
+                    # padding
+                    tensors = [converter(x) for x in tensors]
+                    if tensors[0].ndim == 1:
+                        # input_ids or mask
+                        result.append(torch.stack([(torch.nn.functional.pad(x, (0, max_len - x.shape[0]))) for x in tensors]))
+                    else:
+                        # text encoder outputs
+                        result.append(torch.stack([(torch.nn.functional.pad(x, (0, 0, 0, max_len - x.shape[0]))) for x in tensors]))
+            return result
+
+        # set example
+        example = {}
+        example["custom_attributes"] = custom_attributes  # may be list of empty dict
+        example["loss_weights"] = torch.FloatTensor(loss_weights)
+        example["text_encoder_outputs_list"] = none_or_stack_elements(text_encoder_outputs_list, torch.FloatTensor)
+        example["input_ids_list"] = none_or_stack_elements(input_ids_list, lambda x: x)
+
+        # if one of alpha_masks is not None, we need to replace None with ones
+        none_or_not = [x is None for x in alpha_mask_list]
+        if all(none_or_not):
+            example["alpha_masks"] = None
+        elif any(none_or_not):
+            for i in range(len(alpha_mask_list)):
+                if alpha_mask_list[i] is None:
+                    if images[i] is not None:
+                        alpha_mask_list[i] = torch.ones((images[i].shape[1], images[i].shape[2]), dtype=torch.float32)
+                    else:
+                        alpha_mask_list[i] = torch.ones(
+                            (latents_list[i].shape[1] * 8, latents_list[i].shape[2] * 8), dtype=torch.float32
+                        )
+            example["alpha_masks"] = torch.stack(alpha_mask_list)
+        else:
+            example["alpha_masks"] = torch.stack(alpha_mask_list)
+
+        if images[0] is not None:
+            images = torch.stack(images)
+            images = images.to(memory_format=torch.contiguous_format).float()
+        else:
+            images = None
+        example["images"] = images
+
+        example["masks"] = torch.stack(masks) if masks else None
+        example["masked_images"] = torch.stack(masked_images) if masked_images else None
+
+        example["latents"] = torch.stack(latents_list) if latents_list[0] is not None else None
+        example["captions"] = captions
+
+        example["original_sizes_hw"] = torch.stack([torch.LongTensor(x) for x in original_sizes_hw])
+        example["crop_top_lefts"] = torch.stack([torch.LongTensor(x) for x in crop_top_lefts])
+        example["target_sizes_hw"] = torch.stack([torch.LongTensor(x) for x in target_sizes_hw])
+        example["flippeds"] = flippeds
+
+        example["network_multipliers"] = torch.FloatTensor([self.network_multiplier] * len(captions))
+
+        if self.debug_dataset:
+            example["image_keys"] = bucket[image_index : image_index + self.batch_size]
+        return example
 
 
 class FineTuningDataset(BaseDataset):
