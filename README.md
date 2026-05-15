@@ -2,6 +2,61 @@
 
 [English](./README.md) / [日本語](./README-ja.md)
 
+## External Caption Dataset (大規模 caption 数据集支持)
+
+DreamBoothDataset 支持从外部 Hugging Face datasets (PyArrow/parquet) 读取 caption，适用于百万级图片、每图有多种 caption 的大规模训练场景。
+
+### 用法
+
+**1. 生成 metadata_cache.json（仅含图片尺寸）**
+
+```bash
+python tools/create_metadata_cache.py --image_dir ./data/images
+# 输出: ./data/images/metadata_cache.json
+```
+
+**2. 生成全局 HF caption dataset**
+
+从 JSON 文件（格式 `{"image.jpg": ["caption1", "caption2", ...], ...}`）或图片目录下的 `.caption` 文件生成：
+
+```bash
+# JSON 模式
+python tools/create_caption_dataset.py --caption_json captions.json --output ./hf_caption_dataset
+
+# 目录模式（读取 .caption 文件，每行一个独立 caption）
+python tools/create_caption_dataset.py --image_dir ./data/images --output ./hf_caption_dataset
+```
+
+**3. 训练配置**
+
+在 dataset config 中指定 `caption_dataset_path`：
+
+```toml
+[general]
+resolution = [512, 512]
+
+[[datasets]]
+batch_size = 2
+caption_dataset_path = "./hf_caption_dataset"  # ← 新增参数
+
+  [[datasets.subsets]]
+  image_dir = "./data/images"
+  num_repeats = 1
+  cache_info = true  # 使用 metadata_cache.json
+```
+
+- 第 N 个 epoch 自动选取 `captions[(N-1) % len(captions)]`
+- HF dataset 通过 PyArrow 内存映射读取，不占大量 RAM
+- caption 应已预处理完成，训练时跳过 `process_caption`（prefix/suffix/dropout 无效）
+
+### 依赖
+
+```bash
+pip install datasets  # HF datasets 库
+```
+
+---
+
 ## Table of Contents
 <details>
 <summary>Click to expand</summary>
